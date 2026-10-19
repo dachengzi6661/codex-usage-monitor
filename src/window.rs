@@ -36,6 +36,7 @@ use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::user_presets::{UserPresets, MAX_USER_PRESETS};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -63,6 +64,7 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     appearance: Appearance,
+    color_presets: UserPresets,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -171,6 +173,11 @@ const IDM_CODEX_BAR_COLOR: u16 = 103;
 const IDM_CODEX_PERCENT_COLOR: u16 = 104;
 const IDM_CODEX_PRESET_FIRST: u16 = 110;
 const IDM_CODEX_PRESET_LAST: u16 = 114;
+const IDM_SAVE_COLOR_PRESET: u16 = 115;
+const IDM_USER_PRESET_FIRST: u16 = 400;
+const IDM_USER_PRESET_LAST: u16 = IDM_USER_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
+const IDM_DELETE_PRESET_FIRST: u16 = 500;
+const IDM_DELETE_PRESET_LAST: u16 = IDM_DELETE_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -450,6 +457,8 @@ struct SettingsFile {
     language: Option<String>,
     #[serde(default)]
     appearance: Appearance,
+    #[serde(default)]
+    color_presets: UserPresets,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
@@ -481,6 +490,7 @@ impl Default for SettingsFile {
             adaptive_refresh: true,
             language: None,
             appearance: Appearance::default(),
+            color_presets: UserPresets::default(),
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: false,
@@ -614,6 +624,7 @@ fn save_state_settings() {
                 .language_override
                 .map(|language| language.code().to_string()),
             appearance: s.appearance,
+            color_presets: s.color_presets.clone(),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
@@ -2009,6 +2020,7 @@ pub fn run() {
                 language_override,
                 language,
                 appearance: settings.appearance,
+                color_presets: settings.color_presets.clone(),
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -3585,6 +3597,27 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_SAVE_COLOR_PRESET => save_current_color_preset(hwnd),
+                IDM_USER_PRESET_FIRST..=IDM_USER_PRESET_LAST => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if let Some(colors) = s
+                                .color_presets
+                                .entries()
+                                .get((id - IDM_USER_PRESET_FIRST) as usize)
+                                .map(|entry| entry.colors)
+                            {
+                                s.appearance.codex_colors = colors;
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_DELETE_PRESET_FIRST..=IDM_DELETE_PRESET_LAST => {
+                    delete_color_preset(hwnd, (id - IDM_DELETE_PRESET_FIRST) as usize);
+                }
                 IDM_CODEX_ICON_COLOR | IDM_CODEX_BAR_COLOR | IDM_CODEX_PERCENT_COLOR => {
                     let role = match id {
                         IDM_CODEX_ICON_COLOR => ColorRole::Icon,
@@ -3840,8 +3873,130 @@ unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
     );
 }
 
+fn save_current_color_preset(hwnd: HWND) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().map(|s| {
+            (
+                s.appearance.codex_colors,
+                s.color_presets.clone(),
+                s.language == LanguageId::SimplifiedChinese,
+            )
+        })
+    };
+    let Some((colors, library, chinese)) = snapshot else {
+        return;
+    };
+    let initial = (1..=MAX_USER_PRESETS + 1)
+        .map(|index| {
+            if chinese {
+                format!("我的配色 {index}")
+            } else {
+                format!("Custom {index}")
+            }
+        })
+        .find(|name| library.find(name).is_none())
+        .unwrap_or_default();
+    // Both dialogs run nested message loops; all STATE guards must be released.
+    let Some(name) = crate::preset_dialog::prompt(hwnd, chinese, &initial) else {
+        return;
+    };
+    if library.find(&name).is_some() {
+        let question = if chinese {
+            format!("已存在预设“{name}”。是否用当前配色覆盖？")
+        } else {
+            format!("A preset named “{name}” already exists. Replace it with the current colors?")
+        };
+        if !confirm_preset_action(hwnd, chinese, &question) {
+            return;
+        }
+    }
+    let result = {
+        let mut state = lock_state();
+        state.as_mut().map(|s| s.color_presets.save(&name, colors))
+    };
+    if matches!(result, Some(Ok(()))) {
+        save_state_settings();
+    } else if matches!(result, Some(Err(_))) {
+        let text = native_interop::wide_str(if chinese {
+            "无法保存：名称须为 1–40 个字符，最多保存 32 个预设。请删除不需要的预设后再试。"
+        } else {
+            "Unable to save. Use a name of 1–40 characters; up to 32 presets can be saved. Delete an unused preset and try again."
+        });
+        let title = native_interop::wide_str(if chinese {
+            "配色预设"
+        } else {
+            "Color presets"
+        });
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+fn confirm_preset_action(hwnd: HWND, chinese: bool, question: &str) -> bool {
+    let title = native_interop::wide_str(if chinese {
+        "配色预设"
+    } else {
+        "Color presets"
+    });
+    let question = native_interop::wide_str(question);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR(question.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+fn delete_color_preset(hwnd: HWND, index: usize) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| {
+            s.color_presets.entries().get(index).map(|entry| {
+                (
+                    entry.name.clone(),
+                    s.language == LanguageId::SimplifiedChinese,
+                )
+            })
+        })
+    };
+    let Some((name, chinese)) = snapshot else {
+        return;
+    };
+    let question = if chinese {
+        format!("删除预设“{name}”？当前显示的配色不会改变。")
+    } else {
+        format!("Delete the preset “{name}”? The current colors will not change.")
+    };
+    if !confirm_preset_action(hwnd, chinese, &question) {
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.color_presets.remove(index);
+        }
+    }
+    save_state_settings();
+}
+
 fn show_context_menu(hwnd: HWND) {
     unsafe {
+        let color_presets = {
+            let state = lock_state();
+            state
+                .as_ref()
+                .map(|s| s.color_presets.clone())
+                .unwrap_or_default()
+        };
         let (
             current_interval,
             strings,
@@ -4088,6 +4243,17 @@ fn show_context_menu(hwnd: HWND) {
                 preset.label(chinese),
             );
         }
+        if !color_presets.entries().is_empty() {
+            let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            for (index, entry) in color_presets.entries().iter().enumerate() {
+                append_appearance_choice(
+                    codex_colors_menu,
+                    IDM_USER_PRESET_FIRST + index as u16,
+                    appearance.codex_colors == entry.colors,
+                    &entry.name.replace('&', "&&"),
+                );
+            }
+        }
         let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
         for (id, label) in [
             (
@@ -4121,6 +4287,38 @@ fn show_context_menu(hwnd: HWND) {
                 MF_STRING,
                 id as usize,
                 PCWSTR(label.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let save_label = native_interop::wide_str(if chinese {
+            "保存当前配色为自定义预设…"
+        } else {
+            "Save current colors as preset…"
+        });
+        let _ = AppendMenuW(
+            codex_colors_menu,
+            MF_STRING,
+            IDM_SAVE_COLOR_PRESET as usize,
+            PCWSTR(save_label.as_ptr()),
+        );
+        if !color_presets.entries().is_empty() {
+            let delete_menu = CreatePopupMenu().unwrap();
+            for (index, entry) in color_presets.entries().iter().enumerate() {
+                append_appearance_choice(
+                    delete_menu,
+                    IDM_DELETE_PRESET_FIRST + index as u16,
+                    false,
+                    &entry.name.replace('&', "&&"),
+                );
+            }
+            append_appearance_submenu(
+                codex_colors_menu,
+                delete_menu,
+                if chinese {
+                    "删除自定义预设"
+                } else {
+                    "Delete custom preset"
+                },
             );
         }
         append_appearance_submenu(
@@ -4881,7 +5079,13 @@ mod tests {
         assert_eq!(settings.tray_offset, 321);
         assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
         assert_eq!(settings.appearance.codex_colors, CodexColors::default());
+        assert!(settings.color_presets.entries().is_empty());
+        let mut saved = UserPresets::default();
+        saved
+            .save("Evening rose", CodexColors::from_preset(ColorPreset::Rose))
+            .unwrap();
         let customized = SettingsFile {
+            color_presets: saved,
             appearance: Appearance {
                 bar_style: BarStyle::ClassicSegmented,
                 codex_colors: CodexColors::from_preset(ColorPreset::Clay),
@@ -4892,6 +5096,7 @@ mod tests {
         let json = serde_json::to_string(&customized).unwrap();
         let restored: SettingsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.appearance, customized.appearance);
+        assert_eq!(restored.color_presets, customized.color_presets);
         assert_eq!(restored.tray_offset, 321);
     }
 
