@@ -17,6 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::codex_colors::{CodexColors, ColorPreset, ColorRole};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -164,6 +165,12 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
+const IDM_BAR_CLASSIC: u16 = 101;
+const IDM_CODEX_ICON_COLOR: u16 = 102;
+const IDM_CODEX_BAR_COLOR: u16 = 103;
+const IDM_CODEX_PERCENT_COLOR: u16 = 104;
+const IDM_CODEX_PRESET_FIRST: u16 = 110;
+const IDM_CODEX_PRESET_LAST: u16 = 114;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -355,6 +362,7 @@ enum BarStyle {
     #[default]
     Continuous,
     Segmented,
+    ClassicSegmented,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +388,7 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    codex_colors: CodexColors,
 }
 
 impl Appearance {
@@ -389,6 +398,7 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            codex_colors: CodexColors::default(),
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -2293,7 +2303,10 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2532,7 +2545,13 @@ fn paint_content(
             icon_x += model_width;
         }
         if show_codex {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+            provider_icons::draw_codex(
+                hdc,
+                icon_x,
+                icon_y,
+                icon_size,
+                appearance.codex_colors.icon_tint(is_dark),
+            );
         }
 
         if show_session_window {
@@ -3566,6 +3585,48 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_CODEX_ICON_COLOR | IDM_CODEX_BAR_COLOR | IDM_CODEX_PERCENT_COLOR => {
+                    let role = match id {
+                        IDM_CODEX_ICON_COLOR => ColorRole::Icon,
+                        IDM_CODEX_BAR_COLOR => ColorRole::Bar,
+                        _ => ColorRole::Percentage,
+                    };
+                    let initial = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| {
+                            s.appearance
+                                .codex_colors
+                                .color(role, s.appearance.is_dark(s.is_dark))
+                        })
+                    };
+                    // The native dialog runs a nested message loop: never hold STATE here.
+                    if let Some(initial) = initial {
+                        if let Some(color) = crate::color_picker::choose(hwnd, initial) {
+                            {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    s.appearance.codex_colors.set(role, color);
+                                }
+                            }
+                            save_state_settings();
+                            render_layered();
+                        }
+                    }
+                }
+                IDM_CODEX_PRESET_FIRST..=IDM_CODEX_PRESET_LAST => {
+                    if let Some(preset) =
+                        ColorPreset::ALL.get((id - IDM_CODEX_PRESET_FIRST) as usize)
+                    {
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.appearance.codex_colors = CodexColors::from_preset(*preset);
+                            }
+                        }
+                        save_state_settings();
+                        render_layered();
+                    }
+                }
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
                 | IDM_PALETTE_SYSTEM
@@ -3573,6 +3634,7 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_PALETTE_LIGHT
                 | IDM_BAR_CONTINUOUS
                 | IDM_BAR_SEGMENTED
+                | IDM_BAR_CLASSIC
                 | IDM_BAR_STANDARD
                 | IDM_BAR_SLIM
                 | IDM_FONT_STANDARD
@@ -3594,6 +3656,9 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 IDM_BAR_CONTINUOUS => s.appearance.bar_style = BarStyle::Continuous,
                                 IDM_BAR_SEGMENTED => s.appearance.bar_style = BarStyle::Segmented,
+                                IDM_BAR_CLASSIC => {
+                                    s.appearance.bar_style = BarStyle::ClassicSegmented
+                                }
                                 IDM_BAR_STANDARD => {
                                     s.appearance.bar_thickness = BarThickness::Standard
                                 }
@@ -4014,6 +4079,59 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let codex_colors_menu = CreatePopupMenu().unwrap();
+        for (index, preset) in ColorPreset::ALL.iter().enumerate() {
+            append_appearance_choice(
+                codex_colors_menu,
+                IDM_CODEX_PRESET_FIRST + index as u16,
+                appearance.codex_colors.is_preset(*preset),
+                preset.label(chinese),
+            );
+        }
+        let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, label) in [
+            (
+                IDM_CODEX_ICON_COLOR,
+                if chinese {
+                    "图标颜色…"
+                } else {
+                    "Icon color…"
+                },
+            ),
+            (
+                IDM_CODEX_BAR_COLOR,
+                if chinese {
+                    "进度条颜色…"
+                } else {
+                    "Bar color…"
+                },
+            ),
+            (
+                IDM_CODEX_PERCENT_COLOR,
+                if chinese {
+                    "百分比颜色…"
+                } else {
+                    "Percentage color…"
+                },
+            ),
+        ] {
+            let label = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                codex_colors_menu,
+                MF_STRING,
+                id as usize,
+                PCWSTR(label.as_ptr()),
+            );
+        }
+        append_appearance_submenu(
+            appearance_menu,
+            codex_colors_menu,
+            if chinese {
+                "Codex 配色"
+            } else {
+                "Codex colors"
+            },
+        );
         let palette_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
             palette_menu,
@@ -4071,6 +4189,16 @@ fn show_context_menu(hwnd: HWND) {
             IDM_BAR_SEGMENTED,
             appearance.bar_style == BarStyle::Segmented,
             if chinese { "分段" } else { "Segmented" },
+        );
+        append_appearance_choice(
+            style_menu,
+            IDM_BAR_CLASSIC,
+            appearance.bar_style == BarStyle::ClassicSegmented,
+            if chinese {
+                "经典分段（矩形）"
+            } else {
+                "Classic segmented (tiles)"
+            },
         );
         append_appearance_submenu(
             appearance_menu,
@@ -4441,7 +4569,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4532,7 +4663,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = provider_icons::codex_color(is_dark);
+    let codex_value_color = appearance.codex_colors.resolve(is_dark).percentage;
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -4643,11 +4774,18 @@ fn draw_usage_bar(
     let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
     let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
-    let corner_r = seg_h / 2;
+    let corner_r = if appearance.bar_style == BarStyle::ClassicSegmented {
+        sc(2)
+    } else {
+        seg_h / 2
+    };
     let bar_y = y + (appearance.row_height() - seg_h) / 2;
 
     let percent_clamped = usage_bar_fill_percentage(percent, text);
-    if appearance.bar_style == BarStyle::Segmented {
+    if matches!(
+        appearance.bar_style,
+        BarStyle::Segmented | BarStyle::ClassicSegmented
+    ) {
         for i in 0..segment_count {
             let rect = RECT {
                 left: bar_x + i * (seg_w + seg_gap),
@@ -4731,8 +4869,35 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 }
 
 #[cfg(test)]
+#[path = "appearance_preview.rs"]
+mod appearance_preview;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_appearance_keeps_its_style_and_default_codex_colors() {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"tray_offset":321,"appearance":{"bar_style":"segmented","font_size":"large"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.tray_offset, 321);
+        assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
+        assert_eq!(settings.appearance.codex_colors, CodexColors::default());
+        let customized = SettingsFile {
+            appearance: Appearance {
+                bar_style: BarStyle::ClassicSegmented,
+                codex_colors: CodexColors::from_preset(ColorPreset::Clay),
+                ..Appearance::default()
+            },
+            ..settings
+        };
+        let json = serde_json::to_string(&customized).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.appearance, customized.appearance);
+        assert_eq!(restored.tray_offset, 321);
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {

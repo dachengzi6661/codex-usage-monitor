@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod codex_colors;
+mod color_picker;
 mod diagnose;
 mod localization;
 mod models;
