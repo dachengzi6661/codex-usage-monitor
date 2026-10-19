@@ -4126,11 +4126,7 @@ fn show_context_menu(hwnd: HWND) {
         append_appearance_submenu(
             appearance_menu,
             codex_colors_menu,
-            if chinese {
-                "Codex 配色"
-            } else {
-                "Codex colors"
-            },
+            if chinese { "配色" } else { "Colors" },
         );
         let palette_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
@@ -4167,9 +4163,9 @@ fn show_context_menu(hwnd: HWND) {
             appearance_menu,
             palette_menu,
             if chinese {
-                "文字与颜色"
+                "背景样式"
             } else {
-                "Text and colors"
+                "Background style"
             },
         );
 

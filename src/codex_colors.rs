@@ -40,7 +40,8 @@ fn deserialize_color<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
 #[serde(rename_all = "snake_case")]
 pub enum ColorPreset {
     Clay,
-    Mint,
+    #[serde(alias = "mint")]
+    Rose,
     Glacier,
     Lilac,
     #[default]
@@ -52,7 +53,7 @@ impl ColorPreset {
     pub const ALL: [Self; 5] = [
         Self::Original,
         Self::Clay,
-        Self::Mint,
+        Self::Rose,
         Self::Glacier,
         Self::Lilac,
     ];
@@ -61,12 +62,12 @@ impl ColorPreset {
         match (self, chinese) {
             (Self::Original, true) => "原始配色",
             (Self::Clay, true) => "陶土橙",
-            (Self::Mint, true) => "薄荷绿",
+            (Self::Rose, true) => "玫瑰粉",
             (Self::Glacier, true) => "冰川蓝",
             (Self::Lilac, true) => "柔雾紫",
             (Self::Original, false) => "Original",
             (Self::Clay, false) => "Terracotta",
-            (Self::Mint, false) => "Mint",
+            (Self::Rose, false) => "Rose",
             (Self::Glacier, false) => "Glacier",
             (Self::Lilac, false) => "Lilac",
         }
@@ -78,8 +79,8 @@ impl ColorPreset {
             (Self::Original, false) => (0x0F8F70, 0x0F8F70),
             (Self::Clay, true) => (0xD97757, 0xF3D6C5),
             (Self::Clay, false) => (0xA94F32, 0x803B25),
-            (Self::Mint, true) => (0x34D399, 0xB8F3DC),
-            (Self::Mint, false) => (0x0F8F70, 0x14624E),
+            (Self::Rose, true) => (0xF08FA3, 0xFFD8E1),
+            (Self::Rose, false) => (0xB83B61, 0x8F2448),
             (Self::Glacier, true) => (0x60A5FA, 0xD3E5FF),
             (Self::Glacier, false) => (0x2563EB, 0x1E40AF),
             (Self::Lilac, true) => (0xB8A2F2, 0xE9DFFC),
@@ -196,7 +197,7 @@ mod tests {
             );
         }
         assert!(!colors.is_preset(ColorPreset::Glacier));
-        assert!(CodexColors::from_preset(ColorPreset::Mint).is_preset(ColorPreset::Mint));
+        assert!(CodexColors::from_preset(ColorPreset::Rose).is_preset(ColorPreset::Rose));
     }
 
     #[test]
@@ -210,6 +211,17 @@ mod tests {
         }
         let unknown: CodexColors = serde_json::from_str(r#"{"preset":"future"}"#).unwrap();
         assert_eq!(unknown, CodexColors::default());
+    }
+
+    #[test]
+    fn legacy_mint_preset_migrates_to_rose_without_losing_custom_colors() {
+        let colors: CodexColors =
+            serde_json::from_str(r##"{"preset":"mint","bar":"#123456"}"##).unwrap();
+        assert_eq!(colors.preset, ColorPreset::Rose);
+        assert_eq!(colors.bar, Some(Rgb(0x123456)));
+        let saved = serde_json::to_string(&colors).unwrap();
+        assert!(saved.contains("\"preset\":\"rose\""));
+        assert!(!saved.contains("mint"));
     }
 
     #[test]
